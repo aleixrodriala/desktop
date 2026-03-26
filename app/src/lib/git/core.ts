@@ -17,6 +17,7 @@ import { kStringMaxLength } from 'buffer'
 import { withHooksEnv } from '../hooks/with-hooks-env'
 import { coerceToString } from './coerce-to-string'
 import { pushTerminalChunk } from './push-terminal-chunk'
+import { isWSLPath, daemonExecGit } from '../wsl'
 
 export const isMaxBufferExceededError = (
   error: unknown
@@ -235,6 +236,63 @@ export async function git(
   }
 
   const opts = { ...defaultOptions, ...options }
+
+  // ── WSL path: route through daemon instead of dugite ──
+  if (isWSLPath(path)) {
+    const commandName = `${name}: git ${args.join(' ')}`
+    const result = await GitPerf.measure(commandName, () =>
+      daemonExecGit(args, path, {
+        encoding: options?.encoding === 'buffer' ? 'buffer' : undefined,
+      })
+    )
+
+    const exitCode = result.exitCode
+    let gitError: DugiteError | null = null
+    const acceptableExitCode = opts.successExitCodes
+      ? opts.successExitCodes.has(exitCode)
+      : false
+
+    const stderrStr = result.stderr
+    const stdoutStr =
+      typeof result.stdout === 'string'
+        ? result.stdout
+        : (result.stdout as Buffer).toString('utf8')
+
+    if (!acceptableExitCode) {
+      gitError = parseError(stderrStr)
+      if (gitError === null) {
+        gitError = parseError(stdoutStr)
+      }
+    }
+
+    const gitErrorDescription =
+      gitError !== null ? getDescriptionForError(gitError, stderrStr) : null
+
+    const gitResult: IGitResult = {
+      stdout: result.stdout as any,
+      stderr: result.stderr as any,
+      exitCode,
+      gitError,
+      gitErrorDescription,
+      path,
+    }
+
+    let acceptableError = true
+    if (gitError !== null && opts.expectedErrors) {
+      acceptableError = opts.expectedErrors.has(gitError)
+    }
+
+    if ((gitError !== null && acceptableError) || acceptableExitCode) {
+      return gitResult
+    }
+
+    log.error(
+      `\`git ${args.join(' ')}\` exited with an unexpected code: ${exitCode}.\n${stderrStr.slice(-1024)}`
+    )
+    throw new GitError(gitResult, args, stderrStr)
+  }
+
+  // ── Standard (non-WSL) path: use dugite as before ──
 
   // The combined contents of stdout and stderr with some light processing
   // applied to remove redundant lines caused by Git's use of `\r` to "erase"
