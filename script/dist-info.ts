@@ -137,7 +137,7 @@ export function getDistArchitecture(): 'arm64' | 'x64' {
 export function getUpdatesURL() {
   // Point to our own GitHub Releases for the WSL fork.
   // Squirrel.Windows expects a URL serving RELEASES + .nupkg files.
-  return `https://github.com/aleixrodriala/desktop/releases/latest/download`
+  return `https://github.com/aleixrodriala/github-desktop-wsl/releases/latest/download`
 }
 
 export function shouldMakeDelta() {
