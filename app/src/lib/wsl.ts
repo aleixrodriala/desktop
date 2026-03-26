@@ -301,18 +301,6 @@ async function daemonRequest(
 
 /* ── Daemon Lifecycle ────────────────────────────────────────────────── */
 
-function wslExec(
-  distro: string,
-  cmd: string,
-  opts?: { encoding?: 'utf8'; timeout?: number }
-): string {
-  return execFileSync('wsl.exe', ['-d', distro, '-e', 'sh', '-c', cmd], {
-    timeout: opts?.timeout ?? 5000,
-    encoding: opts?.encoding,
-    stdio: opts?.encoding ? undefined : 'pipe',
-  }) as unknown as string
-}
-
 function getBundledDaemonPath(): string {
   for (const p of [
     Path.resolve(__dirname, 'wsl-git-daemon'),
@@ -323,45 +311,51 @@ function getBundledDaemonPath(): string {
   throw new Error('wsl-git-daemon binary not found. Build it: cd wsl-daemon && make')
 }
 
-function deployDaemon(distro: string): void {
-  const bundledPath = getBundledDaemonPath()
-
-  try {
-    wslExec(distro, `test -x ${DAEMON_DEPLOY_BIN}`)
-    const localSize = fs.statSync(bundledPath).size
-    const remoteSize = wslExec(distro, `stat -c '%s' ${DAEMON_DEPLOY_BIN}`, { encoding: 'utf8' }).trim()
-    if (String(localSize) === remoteSize) return
-  } catch {
-    // Binary missing or check failed — deploy
-  }
-
-  const wslPath = wslExec(
-    distro,
-    `wslpath -a '${bundledPath.replace(/'/g, "'\\''")}'`,
-    { encoding: 'utf8' }
-  ).trim()
-
-  wslExec(
-    distro,
-    `mkdir -p ${DAEMON_DEPLOY_DIR} && cp "${wslPath}" ${DAEMON_DEPLOY_BIN} && chmod 755 ${DAEMON_DEPLOY_BIN}`,
-    { timeout: 10000 }
-  )
-}
+let daemonStarting: Promise<void> | null = null
 
 async function startDaemon(distro: string): Promise<void> {
-  deployDaemon(distro)
+  // Prevent concurrent starts (multiple WSL repos refreshing at once)
+  if (daemonStarting) return daemonStarting
+  daemonStarting = startDaemonImpl(distro).finally(() => { daemonStarting = null })
+  return daemonStarting
+}
 
+async function startDaemonImpl(distro: string): Promise<void> {
+  // All wsl.exe calls run async to avoid blocking the UI thread
+  const { execFile } = require('child_process') as typeof import('child_process')
+
+  const wslAsync = (cmd: string, timeout = 5000): Promise<string> =>
+    new Promise((resolve, reject) => {
+      execFile('wsl.exe', ['-d', distro, '-e', 'sh', '-c', cmd],
+        { timeout, encoding: 'utf8' },
+        (err: Error | null, stdout: string) => err ? reject(err) : resolve(stdout)
+      )
+    })
+
+  // Deploy binary if needed
   try {
-    wslExec(distro, 'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info')
-  } catch { /* no daemon to kill */ }
+    const bundledPath = getBundledDaemonPath()
+    let needsDeploy = true
+    try {
+      await wslAsync(`test -x ${DAEMON_DEPLOY_BIN}`)
+      const localSize = fs.statSync(bundledPath).size
+      const remoteSize = (await wslAsync(`stat -c '%s' ${DAEMON_DEPLOY_BIN}`)).trim()
+      if (String(localSize) === remoteSize) needsDeploy = false
+    } catch { /* needs deploy */ }
 
-  execFileSync(
-    'wsl.exe',
-    ['-d', distro, '-e', 'sh', '-c', `${DAEMON_DEPLOY_BIN} --daemonize`],
-    { timeout: 10000, stdio: 'pipe' }
-  )
+    if (needsDeploy) {
+      const wslPath = (await wslAsync(`wslpath -a '${bundledPath.replace(/'/g, "'\\''")}'`)).trim()
+      await wslAsync(`mkdir -p ${DAEMON_DEPLOY_DIR} && cp "${wslPath}" ${DAEMON_DEPLOY_BIN} && chmod 755 ${DAEMON_DEPLOY_BIN}`, 10000)
+    }
+  } catch (e: any) {
+    throw new Error(`Failed to deploy daemon: ${e.message}`)
+  }
 
-  // Wait for info file to become visible from Windows
+  // Kill stale daemon + start fresh
+  try { await wslAsync('pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info') } catch { /* ok */ }
+  await wslAsync(`${DAEMON_DEPLOY_BIN} --daemonize`, 10000)
+
+  // Wait for info file
   const infoPath = getDaemonInfoUNCPath(distro)
   for (let i = 0; i < 50; i++) {
     await new Promise(r => setTimeout(r, 100))
@@ -370,6 +364,7 @@ async function startDaemon(distro: string): Promise<void> {
       if (info.port && info.token) {
         cachedInfo = info
         cachedDistro = distro
+        persistDistro(distro)
         return
       }
     } catch { continue }
