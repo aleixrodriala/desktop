@@ -63,7 +63,9 @@ let cachedInfoMtime: number = 0
 let cachedDistro: string | null = null
 
 const DAEMON_INFO_LINUX_PATH = '/tmp/wsl-git-daemon.info'
-const DAEMON_DEPLOY_PATH = '/usr/local/bin/wsl-git-daemon'
+// Use ~/.local/bin so we don't need sudo. $HOME is expanded by sh -c.
+const DAEMON_DEPLOY_DIR = '$HOME/.local/bin'
+const DAEMON_DEPLOY_BIN = '$HOME/.local/bin/wsl-git-daemon'
 
 /** Get the UNC path to the daemon info file for a given distro */
 function getDaemonInfoUNCPath(distro: string): string {
@@ -229,7 +231,7 @@ async function daemonRequest(
 /* ── Daemon Lifecycle Management ──────────────────────────────────────── */
 
 import * as Path from 'path'
-import { execFileSync, execFile as execFileCb } from 'child_process'
+import { execFileSync } from 'child_process'
 import { existsSync } from 'fs'
 
 /**
@@ -257,25 +259,23 @@ function getBundledDaemonPath(): string {
  * Deploy the daemon binary into the WSL distro if not already present
  * or if our bundled version is newer.
  */
+function wslExec(distro: string, shellCmd: string, opts?: { encoding?: 'utf8', timeout?: number }): string {
+  return execFileSync(
+    'wsl.exe',
+    ['-d', distro, '-e', 'sh', '-c', shellCmd],
+    { timeout: opts?.timeout ?? 5000, encoding: opts?.encoding, stdio: opts?.encoding ? undefined : 'pipe' }
+  ) as unknown as string
+}
+
 function deployDaemon(distro: string): void {
   const bundledPath = getBundledDaemonPath()
 
   // Check if daemon already exists in WSL
   try {
-    execFileSync(
-      'wsl.exe',
-      ['-d', distro, '-e', 'test', '-x', DAEMON_DEPLOY_PATH],
-      { timeout: 5000, stdio: 'pipe' }
-    )
+    wslExec(distro, `test -x ${DAEMON_DEPLOY_BIN}`)
     // Binary exists — check if we need to update it
-    // Compare sizes as a simple staleness check
     const localSize = require('fs').statSync(bundledPath).size
-    const remoteSize = execFileSync(
-      'wsl.exe',
-      ['-d', distro, '-e', 'stat', '-c', '%s', DAEMON_DEPLOY_PATH],
-      { timeout: 5000, encoding: 'utf8' }
-    ).trim()
-
+    const remoteSize = wslExec(distro, `stat -c '%s' ${DAEMON_DEPLOY_BIN}`, { encoding: 'utf8' }).trim()
     if (String(localSize) === remoteSize) {
       return // same size, assume up to date
     }
@@ -283,26 +283,11 @@ function deployDaemon(distro: string): void {
     // Binary doesn't exist or check failed — deploy it
   }
 
-  // Convert Windows path to WSL path for cp
-  const wslBundledPath = execFileSync(
-    'wsl.exe',
-    ['-d', distro, '-e', 'wslpath', '-a', bundledPath],
-    { timeout: 5000, encoding: 'utf8' }
-  ).trim()
+  // Convert Windows path to WSL path
+  const wslBundledPath = wslExec(distro, `wslpath -a '${bundledPath.replace(/'/g, "'\\''")}'`, { encoding: 'utf8' }).trim()
 
-  // Copy and make executable
-  execFileSync(
-    'wsl.exe',
-    [
-      '-d',
-      distro,
-      '-e',
-      'sh',
-      '-c',
-      `cp "${wslBundledPath}" "${DAEMON_DEPLOY_PATH}" && chmod 755 "${DAEMON_DEPLOY_PATH}"`,
-    ],
-    { timeout: 10000 }
-  )
+  // Ensure directory exists, copy, and make executable
+  wslExec(distro, `mkdir -p ${DAEMON_DEPLOY_DIR} && cp "${wslBundledPath}" ${DAEMON_DEPLOY_BIN} && chmod 755 ${DAEMON_DEPLOY_BIN}`, { timeout: 10000 })
 }
 
 /**
@@ -314,33 +299,19 @@ async function startDaemon(distro: string): Promise<void> {
 
   // Kill any stale daemon
   try {
-    execFileSync(
-      'wsl.exe',
-      ['-d', distro, '-e', 'sh', '-c', 'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info'],
-      { timeout: 5000, stdio: 'pipe' }
-    )
+    wslExec(distro, 'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info')
   } catch {
     // Ignore — no daemon to kill
   }
 
-  // Start daemon in background
-  execFileCb(
+  // Start daemon in background using --daemonize (forks, writes info file, parent exits)
+  execFileSync(
     'wsl.exe',
-    [
-      '-d',
-      distro,
-      '-e',
-      'sh',
-      '-c',
-      `nohup ${DAEMON_DEPLOY_PATH} >/dev/null 2>&1 &`,
-    ],
-    { timeout: 5000 },
-    () => {
-      // Fire and forget — daemon detaches
-    }
+    ['-d', distro, '-e', 'sh', '-c', `${DAEMON_DEPLOY_BIN} --daemonize`],
+    { timeout: 10000, stdio: 'pipe' }
   )
 
-  // Wait for the info file to appear (poll every 100ms, max 5s)
+  // Wait for the info file to be visible from Windows (poll every 100ms, max 5s)
   const infoPath = getDaemonInfoUNCPath(distro)
   const fs = require('fs')
   for (let i = 0; i < 50; i++) {

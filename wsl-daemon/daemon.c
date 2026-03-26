@@ -475,7 +475,14 @@ static void *handle_client(void *arg) {
 
 /* --- Main --- */
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    int daemonize = 0;
+    (void)argc;
+    for (int i = 1; argv[i]; i++) {
+        if (strcmp(argv[i], "--daemonize") == 0 || strcmp(argv[i], "-d") == 0)
+            daemonize = 1;
+    }
+
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
     signal(SIGPIPE, SIG_IGN);
@@ -506,9 +513,26 @@ int main(void) {
     if (listen(sfd, 16) < 0) { perror("listen"); return 1; }
 
     write_info_file(port);
-    printf("wsl-git-daemon listening on 127.0.0.1:%d\n", port);
-    printf("info: %s\n", INFO_PATH);
-    fflush(stdout);
+
+    if (daemonize) {
+        /* Fork into background. Parent exits immediately so wsl.exe returns. */
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 1; }
+        if (pid > 0) {
+            /* Parent: info file is written, daemon is ready. Exit cleanly. */
+            printf("%d\n", pid);
+            return 0;
+        }
+        /* Child: become session leader, close stdio */
+        setsid();
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+    } else {
+        printf("wsl-git-daemon listening on 127.0.0.1:%d\n", port);
+        printf("info: %s\n", INFO_PATH);
+        fflush(stdout);
+    }
 
     while (g_running) {
         struct sockaddr_in client;
