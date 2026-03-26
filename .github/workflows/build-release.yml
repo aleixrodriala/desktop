@@ -33,10 +33,17 @@ jobs:
           path: wsl-daemon/wsl-git-daemon
 
   build-windows:
+    needs: build-daemon
     runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download daemon binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wsl-git-daemon
+          path: wsl-daemon
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -52,6 +59,16 @@ jobs:
         env:
           RELEASE_CHANNEL: production
           NODE_ENV: production
+
+      - name: Verify daemon bundled
+        shell: pwsh
+        run: |
+          if (Test-Path "out\wsl-git-daemon") {
+            Write-Host "wsl-git-daemon found in out/"
+          } else {
+            Write-Error "wsl-git-daemon NOT found in out/ - build.ts did not copy it"
+            exit 1
+          }
 
       - name: Package Windows installer
         run: yarn package
@@ -107,9 +124,7 @@ jobs:
             - Auto-updates from this repository
 
             ## Install
-            1. Download `GitHubDesktopWSLSetup-x64.exe` and run it
-            2. Download `wsl-git-daemon` and install in WSL (`chmod +x && sudo mv wsl-git-daemon /usr/local/bin/`)
-            3. Start the daemon: `wsl-git-daemon &`
+            Download `GitHubDesktopWSLSetup-x64.exe` and run it. That's it — the daemon is bundled and starts automatically when you open a WSL repo.
 
             Windows SmartScreen may warn on first install — click "More info" → "Run anyway".
           files: |
