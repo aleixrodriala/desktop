@@ -3,7 +3,7 @@ import * as Path from 'path'
 import { git, HookCallbackOptions } from './core'
 import { GitError } from 'dugite'
 import { Repository } from '../../models/repository'
-import { pathExists } from '../../ui/lib/path-exists'
+import { wslPathExists as pathExists } from '../wsl'
 import { createMultiOperationTerminalOutputCallback } from './multi-operation-terminal-output'
 
 export enum MergeResult {

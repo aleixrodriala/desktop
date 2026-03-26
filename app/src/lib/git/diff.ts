@@ -24,6 +24,7 @@ import {
 import { DiffParser } from '../diff-parser'
 import { getOldPathOrDefault } from '../get-old-path'
 import { readFile } from 'fs/promises'
+import { isWSLPath, wslReadFile } from '../wsl'
 import { forceUnwrap } from '../fatal-error'
 import { git } from './core'
 import { NullTreeSHA } from './diff-index'
@@ -775,7 +776,10 @@ export async function getWorkingDirectoryImage(
   repository: Repository,
   file: FileChange
 ): Promise<Image> {
-  const contents = await readFile(Path.join(repository.path, file.path))
+  const filePath = Path.join(repository.path, file.path)
+  const contents = isWSLPath(filePath)
+    ? (await wslReadFile(filePath)) as Buffer
+    : await readFile(filePath)
   return new Image(
     contents.buffer,
     contents.toString('base64'),

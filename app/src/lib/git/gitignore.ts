@@ -2,7 +2,12 @@ import * as Path from 'path'
 import * as FS from 'fs'
 import { Repository } from '../../models/repository'
 import { getConfigValue } from './config'
-import { writeFile } from 'fs/promises'
+import {
+  isWSLPath,
+  wslReadFile,
+  wslWriteFile as writeFile,
+  wslUnlink,
+} from '../wsl'
 
 /**
  * Read the contents of the repository .gitignore.
@@ -15,6 +20,15 @@ export async function readGitIgnoreAtRoot(
   repository: Repository
 ): Promise<string | null> {
   const ignorePath = Path.join(repository.path, '.gitignore')
+
+  if (isWSLPath(ignorePath)) {
+    try {
+      const data = await wslReadFile(ignorePath, 'utf8')
+      return data
+    } catch {
+      return null
+    }
+  }
 
   return new Promise<string | null>((resolve, reject) => {
     FS.readFile(ignorePath, 'utf8', (err, data) => {
@@ -44,6 +58,9 @@ export async function saveGitIgnore(
   const ignorePath = Path.join(repository.path, '.gitignore')
 
   if (text === '') {
+    if (isWSLPath(ignorePath)) {
+      return wslUnlink(ignorePath)
+    }
     return new Promise<void>((resolve, reject) => {
       FS.unlink(ignorePath, err => {
         if (err) {

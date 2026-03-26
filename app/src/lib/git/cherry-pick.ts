@@ -24,8 +24,7 @@ import { ManualConflictResolution } from '../../models/manual-conflict-resolutio
 import { stageManualConflictResolution } from './stage'
 import { getCommit } from '.'
 import { IMultiCommitOperationProgress } from '../../models/progress'
-import { readFile } from 'fs/promises'
-import { pathExists } from '../../ui/lib/path-exists'
+import { wslReadFile as readFile, wslPathExists as pathExists } from '../wsl'
 
 /** The app-specific results from attempting to cherry pick commits*/
 export enum CherryPickResult {

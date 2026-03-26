@@ -3,7 +3,7 @@ import * as Path from 'path'
 import { git, IGitStringExecutionOptions } from './core'
 import { Repository } from '../../models/repository'
 import { SubmoduleEntry } from '../../models/submodule'
-import { pathExists } from '../../ui/lib/path-exists'
+import { wslPathExists as pathExists } from '../wsl'
 import { executionOptionsWithProgress, IGitOutput } from '../progress'
 import {
   envForRemoteOperation,

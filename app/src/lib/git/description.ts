@@ -1,5 +1,8 @@
 import * as Path from 'path'
-import { readFile, writeFile } from 'fs/promises'
+import {
+  wslReadFile as readFile,
+  wslWriteFile as writeFile,
+} from '../wsl'
 
 const GitDescriptionPath = '.git/description'
 

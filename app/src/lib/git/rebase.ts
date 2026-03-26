@@ -29,8 +29,7 @@ import { stageFiles } from './update-index'
 import { getStatus } from './status'
 import { getCommitsBetweenCommits } from './rev-list'
 import { Branch } from '../../models/branch'
-import { readFile } from 'fs/promises'
-import { pathExists } from '../../ui/lib/path-exists'
+import { wslReadFile as readFile, wslPathExists as pathExists } from '../wsl'
 
 /** The app-specific results from attempting to rebase a repository */
 export enum RebaseResult {
