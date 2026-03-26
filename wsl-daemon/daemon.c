@@ -155,8 +155,21 @@ static const char *json_find_string(const char *json, const char *key, char *out
     p++;
     size_t i = 0;
     while (*p && *p != '"' && i < out_sz - 1) {
-        if (*p == '\\' && *(p+1)) { p++; }
-        out[i++] = *p++;
+        if (*p == '\\' && *(p+1)) {
+            p++;
+            switch (*p) {
+                case 'n': out[i++] = '\n'; break;
+                case 'r': out[i++] = '\r'; break;
+                case 't': out[i++] = '\t'; break;
+                case '\\': out[i++] = '\\'; break;
+                case '"': out[i++] = '"'; break;
+                case '/': out[i++] = '/'; break;
+                default: out[i++] = *p; break;
+            }
+            p++;
+        } else {
+            out[i++] = *p++;
+        }
     }
     out[i] = '\0';
     return out;
