@@ -50,10 +50,13 @@ export function parseWSLPath(winPath: string): {
   }
 }
 
-/** Resolve WSL path to { distro, linuxPath }, caching the distro. */
+/** Resolve WSL path to { distro, linuxPath }, caching and persisting the distro. */
 function resolveWSLPath(winPath: string): { distro: string; linuxPath: string } {
   const result = parseWSLPath(winPath)
-  cachedDistro = result.distro
+  if (cachedDistro !== result.distro) {
+    cachedDistro = result.distro
+    persistDistro(result.distro)
+  }
   return result
 }
 
@@ -110,11 +113,80 @@ const DAEMON_INFO_LINUX_PATH = '/tmp/wsl-git-daemon.info'
 const DAEMON_DEPLOY_DIR = '$HOME/.local/bin'
 const DAEMON_DEPLOY_BIN = '$HOME/.local/bin/wsl-git-daemon'
 
+/** Persist the active distro so cleanup works across app restarts. */
+function getDistroStatePath(): string {
+  // Use APPDATA on Windows, fallback for dev/test
+  const appData = process.env.APPDATA || process.env.HOME || '/tmp'
+  return Path.join(appData, 'GitHub Desktop WSL', 'wsl-daemon-state.json')
+}
+
+function persistDistro(distro: string): void {
+  try {
+    const statePath = getDistroStatePath()
+    fs.mkdirSync(Path.dirname(statePath), { recursive: true })
+    fs.writeFileSync(statePath, JSON.stringify({ distro }))
+  } catch { /* best effort */ }
+}
+
+function loadPersistedDistro(): string | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(getDistroStatePath(), 'utf8'))
+    return data.distro || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Get the distro the daemon is running in.
+ * Checks in-memory cache, then persisted state.
+ */
+export function getActiveDistro(): string | null {
+  return cachedDistro || loadPersistedDistro()
+}
+
+/**
+ * Stop the daemon in the active distro. Exported for use from main process
+ * quit/uninstall handlers.
+ */
+export function stopDaemon(): void {
+  const distro = getActiveDistro()
+  if (!distro) return
+  try {
+    execFileSync(
+      'wsl.exe',
+      ['-d', distro, '-e', 'sh', '-c', 'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info'],
+      { timeout: 3000, stdio: 'pipe' }
+    )
+  } catch { /* daemon may not be running */ }
+}
+
+/**
+ * Full cleanup: stop daemon + remove binary + remove state file.
+ * Used on uninstall.
+ */
+export function cleanupDaemon(): void {
+  const distro = getActiveDistro()
+  if (!distro) return
+  try {
+    execFileSync(
+      'wsl.exe',
+      ['-d', distro, '-e', 'sh', '-c',
+        'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info $HOME/.local/bin/wsl-git-daemon'],
+      { timeout: 5000, stdio: 'pipe' }
+    )
+  } catch { /* best effort */ }
+  try { fs.unlinkSync(getDistroStatePath()) } catch { /* ok */ }
+}
+
 function getDaemonInfoUNCPath(distro: string): string {
   return `\\\\wsl.localhost\\${distro}\\tmp\\wsl-git-daemon.info`
 }
 
 function readDaemonInfo(distro?: string): DaemonInfo {
+  // Restore cached distro from disk on first call
+  if (!cachedDistro) cachedDistro = loadPersistedDistro()
+
   const pathsToTry: string[] = []
   if (distro) pathsToTry.push(getDaemonInfoUNCPath(distro))
   if (cachedDistro) pathsToTry.push(getDaemonInfoUNCPath(cachedDistro))

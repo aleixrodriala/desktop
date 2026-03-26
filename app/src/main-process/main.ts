@@ -134,15 +134,9 @@ app.on('window-all-closed', () => {
 // WSL: kill the daemon when the app quits
 app.on('will-quit', () => {
   try {
-    const { execFileSync } = require('child_process')
-    execFileSync(
-      'wsl.exe',
-      ['-e', 'sh', '-c', 'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info'],
-      { timeout: 3000, stdio: 'pipe' }
-    )
-  } catch {
-    // WSL not available or daemon wasn't running — fine
-  }
+    const { stopDaemon } = require('../lib/wsl')
+    stopDaemon()
+  } catch { /* ok */ }
 })
 
 process.on('uncaughtException', (error: Error) => {
