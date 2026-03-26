@@ -1,0 +1,135 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # check every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/desktop/desktop.git
+
+      - name: Fetch upstream tags
+        run: git fetch upstream --tags
+
+      - name: Get latest upstream release tag
+        id: upstream
+        run: |
+          LATEST=$(git tag -l 'release-*' | grep -v -E '(beta|test)' | sort -V | tail -1)
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $LATEST"
+
+      - name: Get our latest release tag
+        id: ours
+        run: |
+          OUR_LATEST=$(git tag -l 'wsl-*' | sort -V | tail -1 || echo "none")
+          # Extract the upstream version from our tag (wsl-X.Y.Z → release-X.Y.Z)
+          if [[ "$OUR_LATEST" == "none" ]]; then
+            echo "upstream_version=none" >> "$GITHUB_OUTPUT"
+          else
+            UPSTREAM_VER=$(echo "$OUR_LATEST" | sed 's/^wsl-/release-/')
+            echo "upstream_version=$UPSTREAM_VER" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Our latest: $OUR_LATEST (upstream base: ${UPSTREAM_VER:-none})"
+
+      - name: Check if sync needed
+        id: check
+        run: |
+          if [[ "${{ steps.upstream.outputs.tag }}" == "${{ steps.ours.outputs.upstream_version }}" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with ${{ steps.upstream.outputs.tag }}"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New upstream release: ${{ steps.upstream.outputs.tag }}"
+          fi
+
+      - name: Create branch and apply patches
+        if: steps.check.outputs.skip == 'false'
+        id: apply
+        run: |
+          UPSTREAM_TAG="${{ steps.upstream.outputs.tag }}"
+          VERSION=$(echo "$UPSTREAM_TAG" | sed 's/^release-//')
+          BRANCH="wsl-${VERSION}"
+
+          # Create branch from upstream tag
+          git checkout -b "$BRANCH" "$UPSTREAM_TAG"
+
+          # Cherry-pick our WSL patch commits from wsl-patches branch
+          # Get the patch commits (everything on wsl-patches that isn't on the upstream tag)
+          git fetch origin wsl-patches
+          PATCH_COMMITS=$(git log --reverse --format='%H' origin/wsl-patches --not "$UPSTREAM_TAG" 2>/dev/null || echo "")
+
+          if [[ -z "$PATCH_COMMITS" ]]; then
+            echo "No patch commits found on wsl-patches branch"
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          FAILED=false
+          for COMMIT in $PATCH_COMMITS; do
+            SUBJECT=$(git log --format='%s' -1 "$COMMIT")
+            echo "Cherry-picking: $SUBJECT ($COMMIT)"
+            if ! git cherry-pick "$COMMIT" --no-commit; then
+              echo "CONFLICT cherry-picking $SUBJECT"
+              git cherry-pick --abort || true
+              FAILED=true
+              break
+            fi
+            git commit -C "$COMMIT"
+          done
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            echo "conflict_commit=$SUBJECT" >> "$GITHUB_OUTPUT"
+          else
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            git push origin "$BRANCH"
+          fi
+
+      - name: Create conflict issue
+        if: steps.check.outputs.skip == 'false' && steps.apply.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Sync conflict with upstream ${{ steps.upstream.outputs.tag }}`,
+              body: `Auto-sync failed while cherry-picking patches onto \`${{ steps.upstream.outputs.tag }}\`.\n\nConflicting commit: \`${{ steps.apply.outputs.conflict_commit }}\`\n\nPlease resolve manually and re-trigger the workflow.`,
+              labels: ['sync-conflict']
+            });
+
+      - name: Trigger build
+        if: steps.check.outputs.skip == 'false' && steps.apply.outputs.success == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-release.yml',
+              ref: '${{ steps.apply.outputs.branch }}',
+              inputs: {
+                version: '${{ steps.apply.outputs.version }}'
+              }
+            });

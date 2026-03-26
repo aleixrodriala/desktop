@@ -141,6 +141,10 @@ export function getUpdatesURL() {
 }
 
 export function shouldMakeDelta() {
+  // WSL fork: skip delta generation (no previous releases to diff against)
+  if (process.env.SKIP_CODE_SIGNING) {
+    return false
+  }
   // Only production and beta channels include deltas. Test releases aren't
   // necessarily sequential so deltas wouldn't make sense.
   return ['production', 'beta'].includes(getChannel())

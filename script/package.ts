@@ -104,7 +104,9 @@ function packageWindows() {
     setupMsi: getWindowsInstallerName(),
   }
 
-  if (shouldMakeDelta()) {
+  // WSL fork: skip remote release sync to avoid 404 on first build
+  // and when we don't have Azure code signing
+  if (shouldMakeDelta() && !process.env.SKIP_CODE_SIGNING) {
     const url = new URL(getUpdatesURL())
     // Make sure Squirrel.Windows isn't affected by partially or completely
     // disabled releases.
@@ -112,7 +114,12 @@ function packageWindows() {
     options.remoteReleases = url.toString()
   }
 
-  if (isGitHubActions() && isPublishable()) {
+  // WSL fork: skip Azure code signing (we're unsigned)
+  if (
+    isGitHubActions() &&
+    isPublishable() &&
+    !process.env.SKIP_CODE_SIGNING
+  ) {
     assertNonNullable(process.env.RUNNER_TEMP, 'Missing RUNNER_TEMP env var')
 
     const acsPath = join(process.env.RUNNER_TEMP, 'acs')

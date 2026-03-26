@@ -1,0 +1,118 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 3.5.6)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  build-daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build daemon
+        run: |
+          cd wsl-daemon
+          make
+
+      - name: Upload daemon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-git-daemon
+          path: wsl-daemon/wsl-git-daemon
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-engines
+
+      - name: Build production
+        run: yarn build:prod
+        env:
+          RELEASE_CHANNEL: production
+          NODE_ENV: production
+
+      - name: Package Windows installer
+        run: yarn package
+        env:
+          RELEASE_CHANNEL: production
+          SKIP_CODE_SIGNING: '1'
+
+      - name: List artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\ -Recurse -Include *.exe,*.nupkg,RELEASES | Format-Table Name, Length
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist/*Setup*.exe
+            dist/*.nupkg
+            dist/RELEASES
+
+  release:
+    needs: [build-daemon, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download daemon
+        uses: actions/download-artifact@v4
+        with:
+          name: wsl-git-daemon
+          path: artifacts
+
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wsl-${{ inputs.version }}
+          name: GitHub Desktop WSL v${{ inputs.version }}
+          body: |
+            GitHub Desktop WSL fork — based on upstream release `release-${{ inputs.version }}`.
+
+            ## Changes from upstream
+            - WSL repository support via persistent daemon
+            - Native SSH key access from WSL
+            - File operations routed through WSL daemon (no 9P overhead)
+            - Auto-updates from this repository
+
+            ## Install
+            1. Download `GitHubDesktopWSLSetup-x64.exe` and run it
+            2. Download `wsl-git-daemon` and install in WSL (`chmod +x && sudo mv wsl-git-daemon /usr/local/bin/`)
+            3. Start the daemon: `wsl-git-daemon &`
+
+            Windows SmartScreen may warn on first install — click "More info" → "Run anyway".
+          files: |
+            artifacts/*
+          draft: false
+          prerelease: false
