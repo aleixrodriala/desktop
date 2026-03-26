@@ -7,6 +7,7 @@ import {
   ForkContributionTarget,
 } from './workflow-preferences'
 import { assertNever, fatalError } from '../lib/fatal-error'
+import { isWSLPath } from '../lib/wsl'
 import { createEqualityHash } from './equality-hash'
 
 function getBaseName(path: string): string {
@@ -76,6 +77,11 @@ export class Repository {
 
   public get path(): string {
     return this.mainWorkTree.path
+  }
+
+  /** Whether this repository is on a WSL filesystem */
+  public get isWSL(): boolean {
+    return isWSLPath(this.path)
   }
 }
 
