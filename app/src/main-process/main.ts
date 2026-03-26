@@ -627,7 +627,20 @@ app.on('ready', () => {
     app.moveToApplicationsFolder?.()
   })
 
-  ipcMain.handle('move-to-trash', (_, path) => shell.trashItem(path))
+  ipcMain.handle('move-to-trash', async (_, path) => {
+    // WSL paths can't use Windows Recycle Bin — delete via wsl.exe
+    if (/^\\\\wsl[.$\\]/i.test(path)) {
+      const { execFileSync } = require('child_process')
+      const match = path.toLowerCase().startsWith('\\\\wsl.localhost\\')
+        ? path.slice(16) : path.slice(7)
+      const slashIdx = match.indexOf('\\')
+      const distro = slashIdx === -1 ? match : match.slice(0, slashIdx)
+      const linuxPath = (slashIdx === -1 ? '/' : match.slice(slashIdx)).replace(/\\/g, '/')
+      execFileSync('wsl.exe', ['-d', distro, '-e', 'rm', '-rf', linuxPath], { timeout: 30000 })
+      return
+    }
+    return shell.trashItem(path)
+  })
   ipcMain.handle('show-item-in-folder', async (_, path) =>
     shell.showItemInFolder(path)
   )
