@@ -243,6 +243,7 @@ export async function git(
     const result = await GitPerf.measure(commandName, () =>
       daemonExecGit(args, path, {
         encoding: options?.encoding === 'buffer' ? 'buffer' : undefined,
+        stdin: typeof opts.stdin === 'string' ? opts.stdin : opts.stdin?.toString('utf8'),
       })
     )
 

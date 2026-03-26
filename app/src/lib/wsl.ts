@@ -359,15 +359,17 @@ export interface DaemonGitResult {
 export async function daemonExecGit(
   args: string[],
   cwd: string,
-  options?: { encoding?: 'buffer' | BufferEncoding }
+  options?: { encoding?: 'buffer' | BufferEncoding; stdin?: string }
 ): Promise<DaemonGitResult> {
   const distro = isWSLPath(cwd) ? resolveDistro(cwd) : undefined
   const linuxCwd = isWSLPath(cwd) ? parseWSLPath(cwd).linuxPath : cwd
 
-  const result = await daemonRequest(
-    { cmd: 'git', args, cwd: linuxCwd },
-    distro
-  )
+  const payload: Record<string, unknown> = { cmd: 'git', args, cwd: linuxCwd }
+  if (options?.stdin) {
+    payload.stdin = options.stdin
+  }
+
+  const result = await daemonRequest(payload, distro)
 
   return {
     stdout:

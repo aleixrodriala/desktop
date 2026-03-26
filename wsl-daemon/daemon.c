@@ -209,7 +209,9 @@ static void handle_git(int cfd, const char *json) {
     char **args = NULL;
     int argc = 0;
 
+    char stdin_buf[65536] = "";
     json_find_string(json, "cwd", cwd, sizeof(cwd));
+    json_find_string(json, "stdin", stdin_buf, sizeof(stdin_buf));
     json_find_string_array(json, "args", &args, &argc);
 
     /* Build argv: ["git", args...] */
@@ -218,8 +220,8 @@ static void handle_git(int cfd, const char *json) {
     for (int i = 0; i < argc; i++) argv[i + 1] = args[i];
     argv[argc + 1] = NULL;
 
-    int pipe_out[2], pipe_err[2];
-    if (pipe(pipe_out) < 0 || pipe(pipe_err) < 0) {
+    int pipe_out[2], pipe_err[2], pipe_in[2];
+    if (pipe(pipe_out) < 0 || pipe(pipe_err) < 0 || pipe(pipe_in) < 0) {
         send_error(cfd, "pipe() failed");
         goto cleanup;
     }
@@ -234,8 +236,11 @@ static void handle_git(int cfd, const char *json) {
         /* Child — exec git */
         close(pipe_out[0]);
         close(pipe_err[0]);
+        close(pipe_in[1]);
+        dup2(pipe_in[0], STDIN_FILENO);
         dup2(pipe_out[1], STDOUT_FILENO);
         dup2(pipe_err[1], STDERR_FILENO);
+        close(pipe_in[0]);
         close(pipe_out[1]);
         close(pipe_err[1]);
 
@@ -253,9 +258,14 @@ static void handle_git(int cfd, const char *json) {
         _exit(127);
     }
 
-    /* Parent — relay stdout/stderr to client */
+    /* Parent — write stdin to child if provided, then relay stdout/stderr */
     close(pipe_out[1]);
     close(pipe_err[1]);
+    close(pipe_in[0]);
+    if (stdin_buf[0] != '\0') {
+        write_exact(pipe_in[1], stdin_buf, strlen(stdin_buf));
+    }
+    close(pipe_in[1]); /* Signal EOF to child's stdin */
 
     /* Use non-blocking reads with select */
     fd_set fds;
