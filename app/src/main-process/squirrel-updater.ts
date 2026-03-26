@@ -146,7 +146,44 @@ function createShortcut(locations: ShortcutLocations): Promise<void> {
 
 async function handleUninstall(): Promise<void> {
   await removeShortcut()
-  return uninstallWindowsCLI()
+  await uninstallWindowsCLI()
+  await cleanupWSLDaemon()
+}
+
+/** Kill the WSL daemon and remove the deployed binary on uninstall. */
+async function cleanupWSLDaemon(): Promise<void> {
+  const { execFileSync } = require('child_process')
+  try {
+    // Try all known WSL distros
+    const distros = execFileSync('wsl.exe', ['-l', '-q'], {
+      timeout: 5000,
+      encoding: 'utf16le',
+    })
+      .split('\n')
+      .map((d: string) => d.trim().replace(/\0/g, ''))
+      .filter(Boolean)
+
+    for (const distro of distros) {
+      try {
+        execFileSync(
+          'wsl.exe',
+          [
+            '-d',
+            distro,
+            '-e',
+            'sh',
+            '-c',
+            'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info $HOME/.local/bin/wsl-git-daemon',
+          ],
+          { timeout: 5000, stdio: 'pipe' }
+        )
+      } catch {
+        // Distro might not be running
+      }
+    }
+  } catch {
+    // WSL not available or no distros
+  }
 }
 
 function removeShortcut(): Promise<void> {
