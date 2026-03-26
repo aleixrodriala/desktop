@@ -404,6 +404,16 @@ function copyDependencies() {
     ),
     { recursive: true, verbatimSymlinks: true }
   )
+
+  // WSL fork: bundle the daemon binary for auto-deployment into WSL
+  const daemonSource = path.resolve(projectRoot, 'wsl-daemon', 'wsl-git-daemon')
+  const daemonDest = path.resolve(outRoot, 'wsl-git-daemon')
+  if (existsSync(daemonSource)) {
+    console.log('  Copying wsl-git-daemon binary')
+    cpSync(daemonSource, daemonDest)
+  } else {
+    console.log('  Warning: wsl-git-daemon not found (build with make in wsl-daemon/)')
+  }
 }
 
 function generateLicenseMetadata(outRoot: string) {

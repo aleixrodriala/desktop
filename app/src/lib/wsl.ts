@@ -60,35 +60,49 @@ interface DaemonInfo {
 
 let cachedInfo: DaemonInfo | null = null
 let cachedInfoMtime: number = 0
+let cachedDistro: string | null = null
 
-const DAEMON_INFO_PATH = '\\\\wsl.localhost\\Ubuntu-24.04\\tmp\\wsl-git-daemon.info'
-const DAEMON_INFO_LINUX = '/tmp/wsl-git-daemon.info'
+const DAEMON_INFO_LINUX_PATH = '/tmp/wsl-git-daemon.info'
+const DAEMON_DEPLOY_PATH = '/usr/local/bin/wsl-git-daemon'
 
-function readDaemonInfo(): DaemonInfo {
-  // In the Electron app (Windows), we read via the UNC path
-  // In dev/test, we might be in WSL directly
-  try {
-    const fs = require('fs')
-    let infoPath = DAEMON_INFO_PATH
-    // Try UNC path first (Windows context), fall back to Linux path
-    try {
-      fs.accessSync(infoPath)
-    } catch {
-      infoPath = DAEMON_INFO_LINUX
-    }
-    const stat = fs.statSync(infoPath)
-    if (cachedInfo && stat.mtimeMs === cachedInfoMtime) {
-      return cachedInfo
-    }
-    const raw = fs.readFileSync(infoPath, 'utf8')
-    cachedInfo = JSON.parse(raw.trim())
-    cachedInfoMtime = stat.mtimeMs
-    return cachedInfo!
-  } catch (e: any) {
-    throw new Error(
-      `Cannot read daemon info (is wsl-git-daemon running?): ${e.message}`
-    )
+/** Get the UNC path to the daemon info file for a given distro */
+function getDaemonInfoUNCPath(distro: string): string {
+  return `\\\\wsl.localhost\\${distro}\\tmp\\wsl-git-daemon.info`
+}
+
+/**
+ * Read daemon connection info.
+ * Tries UNC path (Windows/Electron context) first, falls back to Linux path.
+ */
+function readDaemonInfo(distro?: string): DaemonInfo {
+  const fs = require('fs')
+  const pathsToTry: string[] = []
+
+  if (distro) {
+    pathsToTry.push(getDaemonInfoUNCPath(distro))
   }
+  if (cachedDistro) {
+    pathsToTry.push(getDaemonInfoUNCPath(cachedDistro))
+  }
+  // Fallback for running inside WSL directly (dev/test)
+  pathsToTry.push(DAEMON_INFO_LINUX_PATH)
+
+  for (const infoPath of pathsToTry) {
+    try {
+      const stat = fs.statSync(infoPath)
+      if (cachedInfo && stat.mtimeMs === cachedInfoMtime) {
+        return cachedInfo
+      }
+      const raw = fs.readFileSync(infoPath, 'utf8')
+      cachedInfo = JSON.parse(raw.trim())
+      cachedInfoMtime = stat.mtimeMs
+      return cachedInfo!
+    } catch {
+      continue
+    }
+  }
+
+  throw new Error('Cannot read daemon info — daemon not running')
 }
 
 function sendFrame(
@@ -106,19 +120,17 @@ function sendFrame(
   }
 }
 
-/**
- * Connect to daemon, send INIT frame, collect response frames.
- */
-function daemonRequest(
-  initPayload: object
-): Promise<{
+interface DaemonResponse {
   stdout: Buffer
   stderr: Buffer
   exitCode: number
   statResult?: string
-}> {
-  const info = readDaemonInfo()
+}
 
+/**
+ * Connect to daemon, send INIT frame, collect response frames.
+ */
+function daemonRequestRaw(info: DaemonInfo, initPayload: object): Promise<DaemonResponse> {
   return new Promise((resolve, reject) => {
     const socket = new net.Socket()
     const stdoutChunks: Buffer[] = []
@@ -135,11 +147,10 @@ function daemonRequest(
     socket.on('data', (chunk: Buffer) => {
       incomingBuf = Buffer.concat([incomingBuf, chunk])
 
-      // Parse frames from buffer
       while (incomingBuf.length >= 5) {
         const frameType = incomingBuf[0]
         const frameLen = incomingBuf.readUInt32BE(1)
-        if (incomingBuf.length < 5 + frameLen) break // incomplete
+        if (incomingBuf.length < 5 + frameLen) break
 
         const frameData = incomingBuf.slice(5, 5 + frameLen)
         incomingBuf = incomingBuf.slice(5 + frameLen)
@@ -176,12 +187,9 @@ function daemonRequest(
     })
 
     socket.on('error', (err: Error) => {
-      reject(
-        new Error(`Daemon connection failed (is wsl-git-daemon running?): ${err.message}`)
-      )
+      reject(new Error(`Daemon connection failed: ${err.message}`))
     })
 
-    // Timeout after 5 minutes (git operations can be slow)
     socket.setTimeout(300_000, () => {
       socket.destroy()
       reject(new Error('Daemon request timed out'))
@@ -189,41 +197,179 @@ function daemonRequest(
   })
 }
 
-/* ── Daemon auto-start ───────────────────────────────────────────────── */
+/**
+ * Send a request to the daemon, auto-starting it if needed.
+ * Retries once after starting the daemon on connection failure.
+ */
+async function daemonRequest(
+  initPayload: object,
+  distro?: string
+): Promise<DaemonResponse> {
+  // First attempt: try connecting to existing daemon
+  try {
+    const info = readDaemonInfo(distro)
+    return await daemonRequestRaw(info, initPayload)
+  } catch {
+    // Connection failed — daemon probably not running
+  }
 
-let daemonStartAttempted = false
+  // Second attempt: start daemon and retry
+  const d = distro || cachedDistro
+  if (!d) {
+    throw new Error(
+      'WSL daemon is not running and no distro is known. ' +
+        'Open a WSL repository first.'
+    )
+  }
+  await startDaemon(d)
+  const info = readDaemonInfo(d)
+  return daemonRequestRaw(info, initPayload)
+}
+
+/* ── Daemon Lifecycle Management ──────────────────────────────────────── */
+
+import * as Path from 'path'
+import { execFileSync, execFile as execFileCb } from 'child_process'
+import { existsSync } from 'fs'
 
 /**
- * Ensure the daemon is running. Starts it via wsl.exe if needed.
- * Called lazily on first WSL operation.
+ * Get the path to the bundled daemon binary.
+ * In production: __dirname points to the app's resources/out directory.
+ * In development: falls back to the source tree.
  */
-export function ensureDaemonRunning(): void {
-  if (daemonStartAttempted) return
-  daemonStartAttempted = true
-
-  try {
-    readDaemonInfo()
-    return // daemon already running
-  } catch {
-    // Need to start it
+function getBundledDaemonPath(): string {
+  // Production build: binary is copied to out/ by build.ts
+  const prodPath = Path.resolve(__dirname, 'wsl-git-daemon')
+  if (existsSync(prodPath)) {
+    return prodPath
   }
+  // Development: use the binary built in wsl-daemon/
+  const devPath = Path.resolve(__dirname, '..', '..', 'wsl-daemon', 'wsl-git-daemon')
+  if (existsSync(devPath)) {
+    return devPath
+  }
+  throw new Error(
+    'wsl-git-daemon binary not found. Build it: cd wsl-daemon && make'
+  )
+}
 
+/**
+ * Deploy the daemon binary into the WSL distro if not already present
+ * or if our bundled version is newer.
+ */
+function deployDaemon(distro: string): void {
+  const bundledPath = getBundledDaemonPath()
+
+  // Check if daemon already exists in WSL
   try {
-    // Start daemon in background via wsl.exe
-    const { execFile } = require('child_process')
-    execFile(
+    execFileSync(
       'wsl.exe',
-      ['-e', 'sh', '-c', 'nohup wsl-git-daemon >/dev/null 2>&1 &'],
-      { timeout: 5000 },
-      () => {
-        // Don't care about result — daemon detaches itself
-      }
+      ['-d', distro, '-e', 'test', '-x', DAEMON_DEPLOY_PATH],
+      { timeout: 5000, stdio: 'pipe' }
     )
-    // Give it a moment to write the info file
-    // We'll retry readDaemonInfo on first actual request
+    // Binary exists — check if we need to update it
+    // Compare sizes as a simple staleness check
+    const localSize = require('fs').statSync(bundledPath).size
+    const remoteSize = execFileSync(
+      'wsl.exe',
+      ['-d', distro, '-e', 'stat', '-c', '%s', DAEMON_DEPLOY_PATH],
+      { timeout: 5000, encoding: 'utf8' }
+    ).trim()
+
+    if (String(localSize) === remoteSize) {
+      return // same size, assume up to date
+    }
   } catch {
-    // If we can't start it, operations will fail with a clear error
+    // Binary doesn't exist or check failed — deploy it
   }
+
+  // Convert Windows path to WSL path for cp
+  const wslBundledPath = execFileSync(
+    'wsl.exe',
+    ['-d', distro, '-e', 'wslpath', '-a', bundledPath],
+    { timeout: 5000, encoding: 'utf8' }
+  ).trim()
+
+  // Copy and make executable
+  execFileSync(
+    'wsl.exe',
+    [
+      '-d',
+      distro,
+      '-e',
+      'sh',
+      '-c',
+      `cp "${wslBundledPath}" "${DAEMON_DEPLOY_PATH}" && chmod 755 "${DAEMON_DEPLOY_PATH}"`,
+    ],
+    { timeout: 10000 }
+  )
+}
+
+/**
+ * Start the daemon in the given WSL distro and wait for it to be ready.
+ */
+async function startDaemon(distro: string): Promise<void> {
+  // Deploy binary if needed
+  deployDaemon(distro)
+
+  // Kill any stale daemon
+  try {
+    execFileSync(
+      'wsl.exe',
+      ['-d', distro, '-e', 'sh', '-c', 'pkill -f wsl-git-daemon 2>/dev/null; rm -f /tmp/wsl-git-daemon.info'],
+      { timeout: 5000, stdio: 'pipe' }
+    )
+  } catch {
+    // Ignore — no daemon to kill
+  }
+
+  // Start daemon in background
+  execFileCb(
+    'wsl.exe',
+    [
+      '-d',
+      distro,
+      '-e',
+      'sh',
+      '-c',
+      `nohup ${DAEMON_DEPLOY_PATH} >/dev/null 2>&1 &`,
+    ],
+    { timeout: 5000 },
+    () => {
+      // Fire and forget — daemon detaches
+    }
+  )
+
+  // Wait for the info file to appear (poll every 100ms, max 5s)
+  const infoPath = getDaemonInfoUNCPath(distro)
+  const fs = require('fs')
+  for (let i = 0; i < 50; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    try {
+      const raw = fs.readFileSync(infoPath, 'utf8')
+      const info = JSON.parse(raw.trim())
+      if (info.port && info.token) {
+        cachedInfo = info
+        cachedDistro = distro
+        return
+      }
+    } catch {
+      continue
+    }
+  }
+
+  throw new Error(
+    `Daemon failed to start in WSL distro "${distro}" within 5 seconds`
+  )
+}
+
+/**
+ * Extract distro from a WSL path and remember it.
+ */
+function resolveDistro(wslPath: string): string {
+  const { distro } = parseWSLPath(wslPath)
+  cachedDistro = distro
+  return distro
 }
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -237,22 +383,20 @@ export interface DaemonGitResult {
 /**
  * Execute a git command via the daemon.
  * This is the WSL equivalent of dugite's exec().
+ * Automatically starts the daemon if not running.
  */
 export async function daemonExecGit(
   args: string[],
   cwd: string,
   options?: { encoding?: 'buffer' | BufferEncoding }
 ): Promise<DaemonGitResult> {
-  ensureDaemonRunning()
-
-  // Convert Windows WSL path to Linux path for the daemon
+  const distro = isWSLPath(cwd) ? resolveDistro(cwd) : undefined
   const linuxCwd = isWSLPath(cwd) ? parseWSLPath(cwd).linuxPath : cwd
 
-  const result = await daemonRequest({
-    cmd: 'git',
-    args,
-    cwd: linuxCwd,
-  })
+  const result = await daemonRequest(
+    { cmd: 'git', args, cwd: linuxCwd },
+    distro
+  )
 
   return {
     stdout:
@@ -274,16 +418,15 @@ export async function daemonReadFile(
   winPath: string,
   encoding?: 'utf8'
 ): Promise<string | Buffer> {
-  ensureDaemonRunning()
-
+  const distro = isWSLPath(winPath) ? resolveDistro(winPath) : undefined
   const linuxPath = isWSLPath(winPath)
     ? parseWSLPath(winPath).linuxPath
     : winPath
 
-  const result = await daemonRequest({
-    cmd: 'readfile',
-    path: linuxPath,
-  })
+  const result = await daemonRequest(
+    { cmd: 'readfile', path: linuxPath },
+    distro
+  )
 
   if (result.exitCode !== 0) {
     throw new Error(`Failed to read ${winPath}`)
@@ -299,9 +442,14 @@ export async function daemonWriteFile(
   winPath: string,
   content: string | Buffer
 ): Promise<void> {
-  ensureDaemonRunning()
-
-  const info = readDaemonInfo()
+  const distro = isWSLPath(winPath) ? resolveDistro(winPath) : undefined
+  // Ensure daemon is running before we connect
+  try {
+    readDaemonInfo(distro)
+  } catch {
+    if (distro) await startDaemon(distro)
+  }
+  const info = readDaemonInfo(distro)
   const linuxPath = isWSLPath(winPath)
     ? parseWSLPath(winPath).linuxPath
     : winPath
@@ -357,16 +505,15 @@ export async function daemonWriteFile(
  * Delete a file inside WSL via the daemon.
  */
 export async function daemonUnlink(winPath: string): Promise<void> {
-  ensureDaemonRunning()
-
+  const distro = isWSLPath(winPath) ? resolveDistro(winPath) : undefined
   const linuxPath = isWSLPath(winPath)
     ? parseWSLPath(winPath).linuxPath
     : winPath
 
-  const result = await daemonRequest({
-    cmd: 'unlink',
-    path: linuxPath,
-  })
+  const result = await daemonRequest(
+    { cmd: 'unlink', path: linuxPath },
+    distro
+  )
 
   if (result.exitCode !== 0) {
     throw new Error(`Failed to unlink ${winPath}`)
@@ -377,16 +524,15 @@ export async function daemonUnlink(winPath: string): Promise<void> {
  * Check if a path exists inside WSL.
  */
 export async function daemonPathExists(winPath: string): Promise<boolean> {
-  ensureDaemonRunning()
-
+  const distro = isWSLPath(winPath) ? resolveDistro(winPath) : undefined
   const linuxPath = isWSLPath(winPath)
     ? parseWSLPath(winPath).linuxPath
     : winPath
 
-  const result = await daemonRequest({
-    cmd: 'pathexists',
-    path: linuxPath,
-  })
+  const result = await daemonRequest(
+    { cmd: 'pathexists', path: linuxPath },
+    distro
+  )
 
   if (result.statResult) {
     const parsed = JSON.parse(result.statResult)
@@ -401,16 +547,15 @@ export async function daemonPathExists(winPath: string): Promise<boolean> {
 export async function daemonStat(
   winPath: string
 ): Promise<{ exists: boolean; size: number; isDir: boolean }> {
-  ensureDaemonRunning()
-
+  const distro = isWSLPath(winPath) ? resolveDistro(winPath) : undefined
   const linuxPath = isWSLPath(winPath)
     ? parseWSLPath(winPath).linuxPath
     : winPath
 
-  const result = await daemonRequest({
-    cmd: 'stat',
-    path: linuxPath,
-  })
+  const result = await daemonRequest(
+    { cmd: 'stat', path: linuxPath },
+    distro
+  )
 
   if (result.statResult) {
     return JSON.parse(result.statResult)
